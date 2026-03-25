@@ -1,0 +1,197 @@
+/* ============================================================
+   BHKW WARTUNG & REPARATUR – OPTIMIERTE DAX-MEASURE-SAMMLUNG
+   ============================================================ */
+
+/* ============================================================
+   1. BASISMEASURES
+   ============================================================ */
+
+Anlagen gesamt =
+COUNTROWS(Anlagen)
+
+Anlagen gestört =
+VAR GeStörteAnlagen = 
+    CALCULATE(
+        DISTINCTCOUNT(Störungen[AnlageID]),
+        FILTER(ALL(Störungen[Status]), Störungen[Status] <> "behoben")
+    )
+RETURN GeStörteAnlagen
+
+Kritische Störungen =
+VAR KritischeAktiv = 
+    CALCULATE(
+        DISTINCTCOUNT(Störungen[AnlageID]),
+        FILTER(ALL(Störungen[Priorität], Störungen[Status]), 
+            Störungen[Priorität] = "hoch" && Störungen[Status] <> "behoben"
+        )
+    )
+RETURN KritischeAktiv
+
+/* ============================================================
+   2. STILLSTANDSZEITEN – OPTIMIERT
+   ============================================================ */
+
+Stillstandszeit (h) =
+VAR StillstandsStunden =
+    SUMX(
+        FILTER(Störungen, NOT(ISBLANK(Störungen[Endzeit]))),
+        INT(Störungen[Stillstandsstunden])
+    )
+RETURN IF(ISBLANK(StillstandsStunden), 0, StillstandsStunden)
+
+Durchschnittliche Stillstandszeit (h) =
+VAR GesamtStillstand = [Stillstandszeit (h)]
+VAR AnzahlStörungen = COUNTROWS(FILTER(Störungen, NOT(ISBLANK(Störungen[Endzeit]))))
+RETURN DIVIDE(GesamtStillstand, AnzahlStörungen, 0)
+
+/* ============================================================
+   3. SLA-BERECHNUNG – OPTIMIERT
+   ============================================================ */
+
+SLA Reparaturzeit (Soll) =
+VAR SelectedPriorität = SELECTEDVALUE(Störungen[Priorität], "mittel")
+VAR SLAStunden =
+    MAXX(
+        FILTER(ALL(SLA[Priorität]), SLA[Priorität] = SelectedPriorität),
+        SLA[Max_Reparaturzeit_h]
+    )
+RETURN IF(ISBLANK(SLAStunden), 99999, SLAStunden)
+
+SLA Verstoß =
+IF(
+    [Stillstandszeit (h)] > [SLA Reparaturzeit (Soll)],
+    1,
+    0
+)
+
+SLA Verstöße gesamt =
+CALCULATE(
+    COUNTROWS(FILTER(Störungen, [SLA Verstoß] = 1)),
+    ALL(Störungen[Status])
+)
+
+SLA Erfüllung (%) =
+VAR Verstöße = [SLA Verstöße gesamt]
+VAR GesamtStörungen = COUNTROWS(Störungen)
+RETURN DIVIDE(GesamtStörungen - Verstöße, GesamtStörungen, 0)
+
+/* ============================================================
+   4. WARTUNGEN – OPTIMIERT
+   ============================================================ */
+
+Wartungen gesamt =
+COUNTROWS(Wartungen)
+
+Wartungen durchgeführt =
+COUNTROWS(
+    FILTER(ALL(Wartungen[Datum_ist]), 
+        NOT(ISBLANK(Wartungen[Datum_ist]))
+    )
+)
+
+Wartungen überfällig =
+VAR HeutesDatum = TODAY()
+VAR Überfällig =
+    COUNTROWS(
+        FILTER(ALL(Wartungen[Datum_geplant], Wartungen[Datum_ist]),
+            Wartungen[Datum_geplant] < HeutesDatum 
+            && ISBLANK(Wartungen[Datum_ist])
+        )
+    )
+RETURN Überfällig
+
+Wartungsfortschritt (%) =
+DIVIDE(
+    [Wartungen durchgeführt], 
+    [Wartungen gesamt], 
+    0
+)
+
+/* ============================================================
+   5. KOSTEN – OPTIMIERT
+   ============================================================ */
+
+Wartungskosten =
+CALCULATE(SUM(Wartungen[Kosten]), ALL(Wartungen[Status]))
+
+Ersatzteilkosten =
+CALCULATE(SUM(Ersatzteile[Kosten]), ALL(Ersatzteile[Lieferstatus]))
+
+Servicekosten gesamt =
+[Wartungskosten] + [Ersatzteilkosten]
+
+Kosten pro Anlage =
+DIVIDE([Servicekosten gesamt], [Anlagen gesamt], 0)
+
+/* ============================================================
+   6. LIEFERSTATUS – OPTIMIERT
+   ============================================================ */
+
+Lieferverzug (Tage) =
+VAR VerzögerteTeile =
+    SUMX(
+        FILTER(ALL(Ersatzteile[Liiferstatus]), 
+            Ersatzteile[Liiferstatus] = "verzögert"
+            && NOT(ISBLANK(Ersatzteile[Liefertermin_ist]))
+        ),
+        INT(Ersatzteile[Liefertermin_ist] - Ersatzteile[Liefertermin_geplant])
+    )
+RETURN IF(ISBLANK(VerzögerteTeile), 0, VerzögerteTeile)
+
+Kritische Teile nicht verfügbar =
+COUNTROWS(
+    FILTER(ALL(Ersatzteile[Liiferstatus]), 
+        Ersatzteile[Liiferstatus] = "verzögert"
+    )
+)
+
+/* ============================================================
+   7. ANLAGENSTATUS (AMPELLOGIK) – OPTIMIERT
+   ============================================================ */
+
+Aktive Störungen =
+CALCULATE(
+    COUNTROWS(Störungen),
+    FILTER(ALL(Störungen[Status]), Störungen[Status] <> "behoben")
+)
+
+Anlagenstatus =
+VAR AktiveStörungen = [Aktive Störungen]
+VAR ÜberfälligeWartungen = [Wartungen überfällig]
+RETURN 
+    SWITCH(
+        TRUE(),
+        AktiveStörungen > 0, "Rot",
+        ÜberfälligeWartungen > 0, "Gelb",
+        "Grün"
+    )
+
+/* ============================================================
+   8. KPI-ÜBERSICHT – OPTIMIERT
+   ============================================================ */
+
+KPI Anlagen verfügbar (%) =
+VAR GeStörte = [Anlagen gestört]
+VAR Gesamt = [Anlagen gesamt]
+RETURN DIVIDE(Gesamt - GeStörte, Gesamt, 0)
+
+KPI Kosten pro Anlage =
+[Servicekosten gesamt] / [Anlagen gesamt]
+
+KPI Durchschnittliche Reaktionszeit (h) =
+VAR ReaktionszeitGesamt =
+    SUMX(
+        FILTER(ALL(Störungen[Status]), 
+            NOT(ISBLANK(Störungen[SLA_Deadline]))
+            && Störungen[Status] <> "behoben"
+        ),
+        INT(Störungen[SLA_Deadline] - Störungen[Startzeit])
+    )
+VAR AnzahlStörungen = 
+    COUNTROWS(
+        FILTER(ALL(Störungen[Status]), 
+            NOT(ISBLANK(Störungen[SLA_Deadline]))
+            && Störungen[Status] <> "behoben"
+        )
+    )
+RETURN DIVIDE(ReaktionszeitGesamt, AnzahlStörungen, 0)
